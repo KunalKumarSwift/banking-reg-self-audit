@@ -8,7 +8,6 @@ dependencies = [
     "google-adk>=2.8.0",
     "google-cloud-aiplatform[adk,agent-engines]>=2.1.0",
     "google-cloud-discoveryengine>=0.20.3",
-    "google-cloud-storage>=3.14.1",
     "python-dotenv>=1.2.3",
 ]
 

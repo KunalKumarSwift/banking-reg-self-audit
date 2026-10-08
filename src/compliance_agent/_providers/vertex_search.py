@@ -1,8 +1,12 @@
-"""Vertex AI Search implementation of RegulationSearchProvider."""
+"""Vertex AI Search implementation of RegulationSearchProvider.
+
+The summary's references don't carry the gs:// link, so each cited
+document's file name is taken from the matching search result's link.
+"""
 
 from google.cloud import discoveryengine_v1 as discoveryengine
 
-from compliance_agent._contracts.search import RegulationSearchProvider
+from compliance_agent._contracts.search import RegulationSearchProvider, SearchResult
 
 
 class VertexSearchProvider(RegulationSearchProvider):
@@ -22,7 +26,7 @@ class VertexSearchProvider(RegulationSearchProvider):
         )
         self._client = discoveryengine.SearchServiceClient()
 
-    def search(self, query: str) -> str:
+    def search(self, query: str) -> SearchResult:
         """See RegulationSearchProvider.search."""
         request = discoveryengine.SearchRequest(
             serving_config=self._serving_config,
@@ -35,4 +39,17 @@ class VertexSearchProvider(RegulationSearchProvider):
             ),
         )
         response = self._client.search(request)
-        return response.summary.summary_text
+
+        # e.g. "gs://bucket/osfi/B-13-technology-cyber-risk.pdf" -> "B-13-technology-cyber-risk.pdf"
+        file_names = {
+            result.document.name: str(
+                dict(result.document.derived_struct_data).get("link", "")
+            ).rsplit("/", 1)[-1]
+            for result in response.results
+        }
+        sources = [
+            # Chunked data stores cite ".../documents/<id>/chunks/<n>"; results use ".../documents/<id>".
+            file_names.get(ref.document.split("/chunks/")[0]) or ref.title
+            for ref in response.summary.summary_with_metadata.references
+        ]
+        return SearchResult(answer=response.summary.summary_text, sources=sources)

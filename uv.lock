@@ -199,7 +199,6 @@ dependencies = [
     { name = "google-adk" },
     { name = "google-cloud-aiplatform", extra = ["adk", "agent-engines"] },
     { name = "google-cloud-discoveryengine" },
-    { name = "google-cloud-storage" },
     { name = "python-dotenv" },
 ]
 
@@ -208,7 +207,6 @@ requires-dist = [
     { name = "google-adk", specifier = ">=2.8.0" },
     { name = "google-cloud-aiplatform", extras = ["adk", "agent-engines"], specifier = ">=2.1.0" },
     { name = "google-cloud-discoveryengine", specifier = ">=0.20.3" },
-    { name = "google-cloud-storage", specifier = ">=3.14.1" },
     { name = "python-dotenv", specifier = ">=1.2.3" },
 ]
 

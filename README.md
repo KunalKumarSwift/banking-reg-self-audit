@@ -11,11 +11,12 @@ This project builds an AI "assistant" that engineers can ask _early_ — "does m
 To do that, the assistant needs to:
 
 1. **Read** a pile of real regulatory documents (PDFs)
-2. **Search** through them intelligently when asked a question
-3. **Reason** about what it found and give a structured answer
-4. **Live somewhere** so anyone can ask it questions, not just your own laptop
+2. **Search** through them intelligently when asked a question — and also search the web for anything newer than the PDFs
+3. **Reason** about what it found and write a structured report: applicable guidelines, potential gaps, recommendations and open questions, with every claim tied to a listed source
+4. **Hold a conversation**, so engineers can follow up ("how do we fix these gaps?") without starting over
+5. **Live somewhere** so anyone can ask it questions, not just your own laptop
 
-Each of those four things maps to a different piece of Google Cloud, which we'll walk through.
+Each of these maps to a piece of Google Cloud or of the agent code, which we'll walk through.
 
 ---
 
@@ -52,7 +53,7 @@ Google Cloud doesn't let anyone do anything by default — every action needs ex
 - A **service account** is like an employee ID badge — but for a _program_ instead of a person. When your deployed agent runs in the cloud, it's not "you" anymore; it's a robot wearing a badge, and that badge needs its own permissions.
 - A **role** is a bundle of permissions you hand to a badge — e.g., "can search this specific library, but can't add or delete books."
 
-We'll come back to this in detail in Part 5, because it caused us real trouble during deployment — a good learning moment.
+We'll come back to this in detail in Part 6, because it caused us real trouble during deployment — a good learning moment.
 
 ---
 
@@ -129,14 +130,63 @@ You don't have to build any of this — it's what you're paying for by using thi
 
 ## Part 4: The Python Code
 
-### Why we organized the code this way
+### The big picture: a team of agents, not one
+
+The first version of this project was a single agent with one tool. It worked, but answers took one fixed shape and could only see the PDFs. The current version is a small **team of agents**, each with one job, wired together with ADK (Google's **Agent Development Kit**):
+
+```
+user message
+   │
+   ▼
+compliance_assistant (the "front desk")
+   │  ├─ follow-up question?  → answers directly (may do one quick PDF lookup)
+   │  └─ new feature / PRD?   → hands off to the audit pipeline ↓
+   ▼
+audit_pipeline (runs its steps in order)
+   ├─ research (runs its members at the same time)
+   │    ├─ pdf_researcher  → searches our PDFs (Vertex AI Search)
+   │    └─ web_researcher  → searches the web (Google Search)
+   └─ report_writer        → turns both sets of findings into the final report
+```
+
+Three ADK building blocks make this possible:
+
+- **`Agent` (an "LLM agent")** — one Gemini-powered worker with its own instructions and tools.
+- **`ParallelAgent`** — runs its members _at the same time_. The two researchers don't depend on each other, so there's no reason to make one wait for the other.
+- **`SequentialAgent`** — runs its members _in order_. The report writer must wait until research is finished.
+
+**Why a "front desk" agent?** People go back and forth. "How do we fix these gaps?" or "rewrite FR-04 for me" shouldn't trigger two searches and a brand-new seven-section report. The front desk runs the full pipeline only for something new to audit, and answers everything else itself, in whatever shape fits the question.
+
+**How does the next message get back to the front desk?** ADK decides who answers each new message by looking at who spoke last. If that was an agent _inside_ a `SequentialAgent` or `ParallelAgent`, ADK can't hand control back to it (those wrappers can't "transfer"), so it falls back to the top-level agent. That's exactly what we want: every new message starts at the front desk.
+
+### How the code is organized
+
+```
+src/compliance_agent/
+├── agent.py                  # wires the team together; defines root_agent
+├── sub_agents/
+│   ├── pdf_researcher.py     # search_regulations tool + the PDF researcher
+│   ├── web_researcher.py     # Google Search researcher
+│   └── report_writer.py      # writes the final report
+├── _contracts/search.py      # the "promise" a search backend must keep
+├── _providers/vertex_search.py  # the Vertex AI Search implementation
+├── _callbacks.py             # hooks that run after each model reply
+├── _sources.py               # tracks which sources were used; renders the sources table
+├── _report.py                # the report's structure, and turning it into markdown
+├── _prompts.py               # every agent's instructions (plain English)
+└── config.py                 # the only file that reads environment variables
+```
+
+Files starting with `_` are internal helpers; the rest is the agent itself.
+
+### Why we organized the search code this way
 
 We used a **Protocol + Provider** pattern. In plain terms: we separated "_what_ the search feature needs to do" from "_how_ it's actually done today."
 
-- `_contracts/search.py` defines the **contract** — a promise that says "anything claiming to be a search provider must have a `.search(query)` method." This file contains no real logic — just the shape of the promise.
+- `_contracts/search.py` defines the **contract** — a promise that says "anything claiming to be a search provider must have a `.search(query)` method that returns an answer plus the documents it came from." No real logic lives here — just the shape of the promise.
 - `_providers/vertex_search.py` is the **provider** — the actual class that fulfills that promise, using Vertex AI Search specifically.
 
-**Why bother?** If we ever swapped Vertex AI Search for a different tool, only the provider file would need to change — nothing else in the codebase would need to know or care, because everything else only ever talks to the _contract_, never the specific implementation. This is the same idea as a wall socket: any lamp that has the right plug shape works, without the wall needing to know or care which lamp brand you bought.
+**Why bother?** If we ever swapped Vertex AI Search for a different tool, only the provider file would need to change. This is the same idea as a wall socket: any lamp with the right plug works, without the wall caring which brand you bought.
 
 ### `config.py` — one door for secrets
 
@@ -146,7 +196,7 @@ load_dotenv()
 
 This line reads a `.env` file (a plain text file with `KEY=VALUE` lines) and quietly copies those values into the program's environment — as if you'd typed them into your terminal yourself. We keep `.env` out of git (via `.gitignore`) since it holds project-specific values we don't want committed.
 
-**Why only one file is allowed to read environment variables:** it means every other part of the code just receives plain, explicit arguments (like `project_id: str`) — easier to test, easier to reason about, and there's exactly one place to look if a config value is ever wrong.
+**Why only one file is allowed to read environment variables:** every other part of the code just receives plain, explicit values (like `project_id: str`) — easier to test, easier to reason about, and there's exactly one place to look if a config value is ever wrong.
 
 ### `_providers/vertex_search.py` — talking to Google
 
@@ -157,63 +207,105 @@ self._serving_config = (
 )
 ```
 
-Every resource in Google Cloud has a unique "full address," similar to a file path on your computer (`C:\Users\You\Documents\file.txt`) but for cloud resources. This string is that full address for our specific Search app — it says, in order: which project, which region, which "collection" (an organizational grouping Google uses internally), which specific app, and which serving configuration (a named setting profile — we use the default one).
-
-```python
-self._client = discoveryengine.SearchServiceClient()
-```
-
-This creates a "telephone" object — something that knows how to correctly dial and speak Google's API language. It automatically uses whatever login credentials are active (from `gcloud auth application-default login`).
+Every resource in Google Cloud has a unique "full address," similar to a file path on your computer but for cloud resources. This string is that address for our Search app: which project, which region, which "collection" (an internal grouping), which app, and which serving configuration (a named settings profile — we use the default).
 
 ```python
 request = discoveryengine.SearchRequest(
     serving_config=self._serving_config,
     query=query,
-    content_search_spec=discoveryengine.SearchRequest.ContentSearchSpec(
-        summary_spec=discoveryengine.SearchRequest.ContentSearchSpec.SummarySpec(
-            summary_result_count=5,
-            include_citations=True,
-        )
-    ),
+    content_search_spec=...SummarySpec(summary_result_count=5, include_citations=True),
 )
 response = self._client.search(request)
-return response.summary.summary_text
 ```
 
-This builds the actual question we're asking and sends it. `summary_result_count=5` means "consider up to 5 matching passages when writing your answer." `include_citations=True` is what produces those `[1]`, `[2]` markers pointing back to source documents. `response.summary.summary_text` pulls out just the final written answer from a much larger response object (which also contains raw matched documents, relevance scores, etc. — we just don't need those for our use case).
+This sends the question and asks Vertex AI Search to also _write a short summary_ of the top 5 matches, with `[1]`, `[2]` citation markers. The provider then returns two things: the summary text, and the **file names** of the cited PDFs (e.g. `B-13-technology-cyber-risk.pdf`) — those end up in the report's sources table.
 
-**A lesson learned:** we initially hand-built the `serving_config` string. We later checked whether the Google SDK provides a built-in helper for this (`serving_config_path()`) — it does, but only for a slightly different resource shape (data stores, not search "engines"/apps). Lesson: SDK helper methods don't always cover every possible resource shape an API supports — sometimes building the string yourself, carefully, is the correct approach, not a shortcut.
+**A quirk worth knowing:** the summary's citation list tells you _which document_ was cited, but not its file location. The location lives on the separate search results, and the two use slightly different IDs (the citation points at a _chunk_ — `.../documents/<id>/chunks/c4` — while the result points at the whole document). The provider trims off the `/chunks/...` part to match them up.
 
-### `_prompts.py` — teaching the agent how to behave
+**A lesson learned:** we initially hand-built the `serving_config` string, then checked whether the SDK has a helper (`serving_config_path()`). It does, but only for a slightly different resource shape (data stores, not search "apps"). SDK helpers don't always cover every shape an API supports — sometimes building the string yourself, carefully, is the right approach.
 
-This file holds one big string of plain English instructions — the agent's "personality and rules." Kept separate from code because you'll likely tweak the _wording_ often, without needing to touch any logic.
+### The agents, one by one
 
-### `agent.py` — wiring it all together
+**`pdf_researcher`** has one tool, `search_regulations`. Gemini decides on up to 4 focused searches ("biometric consent", "MFA requirements", …) and fires them **all at once**. It then writes its findings as bullet points.
 
-```python
-def search_regulations(query: str) -> str:
-    """Search Canadian banking regulatory guidelines for relevant guidance.
-    ...
-    """
-    return _search_provider.search(query)
-```
+**`web_researcher`** has one tool, Google's built-in `google_search`, to catch guidance newer than our PDFs. It prefers official regulator sites but may also use reputable secondary sources. (Gemini doesn't allow a built-in tool like Google Search in the same agent as our own function tools — another reason each researcher gets exactly one tool.)
 
-This is a completely normal Python function — nothing magical. What makes it usable by an AI agent is its **docstring** (the text in triple quotes). The agent-building framework (**ADK**, Google's Agent Development Kit) reads that docstring to understand _when_ it should call this function and _what_ to pass it — so writing a clear, accurate docstring isn't just good practice here, it directly shapes how well the AI understands its own tool.
+**`report_writer`** has no tools. It reads both researchers' findings and writes the final report.
 
-```python
-root_agent = Agent(
-    name="compliance_self_audit_agent",
-    model=_config.model_name,
-    instruction=SYSTEM_INSTRUCTION,
-    tools=[search_regulations],
-)
-```
+What makes a plain Python function usable as a tool is its **docstring** (the text in triple quotes). ADK reads it to understand _when_ to call the function and _what_ to pass — so a clear docstring directly shapes how well the AI uses its tool.
 
-This creates the actual agent: which AI model powers its thinking (`gemini-2.5-flash`), what its personality/rules are, and which tools (functions) it's allowed to call. `root_agent` is a special name ADK looks for automatically — like how a returnable value in some languages must be named a specific thing by convention.
+### Session state — the team's shared whiteboard
+
+Agents in a pipeline don't call each other. Instead, ADK gives each conversation a **session state**: a shared dictionary every agent can read and write. Think of it as a whiteboard in the team room:
+
+- each researcher writes its findings under its own key (`temp:findings:pdf`, `temp:findings:web`);
+- every search writes down which sources it used (`temp:sources:...`);
+- the report writer reads all of it before it starts.
+
+Keys starting with `temp:` are wiped after every message, so each new question starts with a clean whiteboard.
+
+**Why a separate key per search?** The two researchers write _at the same time_. If they both appended to one shared list, ADK would merge their updates key-by-key and one researcher's sources would silently overwrite the other's.
+
+### Callbacks — hooks that run after each model reply (`_callbacks.py`)
+
+A **callback** is a function ADK calls at a fixed moment — here, right after a model replies, before anyone else sees the reply. We use two:
+
+1. **On each researcher:** save the findings to the whiteboard, then _remove the text from the reply_. Otherwise the researchers' raw notes would flash up in the chat before the report. For web searches, it also keeps only sentences that Google actually linked to a web page, each labelled with its domain and whether that site is an official regulator.
+2. **On the report writer:** turn the report into markdown and attach the sources table.
+
+### The report: structured data, rendered by code (`_report.py`)
+
+The report writer doesn't write markdown. It fills in a **form** — a summary, a list of guideline rows, a list of gap rows, recommendations, open questions — and returns it as JSON (ADK's `output_schema` feature). Code then turns that into markdown tables.
+
+**Why?** Gemini repeatedly broke while writing markdown tables itself: once it "padded" a table row to over 100,000 characters until it hit its length limit, cutting the report off. If the model never writes table syntax, it can't break a table.
+
+Code also enforces two rules the model can't break:
+
+- **No source, no row.** Every guideline and gap must cite a numbered source; rows without one are dropped.
+- **Citations to non-official websites are marked `†`**, e.g. `[1][7†]`.
+
+The **Sources Consulted** section is three tables, numbered continuously: internal documents (our PDFs), official regulator websites, and other web sources (marked as not authoritative).
+
+### `_prompts.py` — teaching each agent how to behave
+
+Every agent's instructions are plain English strings in one file. Kept separate from code because you'll likely tweak the _wording_ often without touching any logic.
+
+### Lessons learned while building the pipeline
+
+- **Callback parameter names matter.** ADK calls callbacks with _keyword_ arguments (`callback_context=`, `llm_response=`), so a parameter named anything else crashes.
+- **An empty reply is an error to ADK.** When the researcher callback removes all the text, ADK (in non-streaming mode) flags a reply that finished with no content as `MODEL_RETURNED_NO_CONTENT`. The callback also clears the "finish reason" so ADK quietly skips the empty reply instead.
+- **"Parallel" tool calls weren't parallel.** ADK runs ordinary (synchronous) Python tools directly on its event loop, so five searches ran one after another — and froze the other researcher meanwhile. Making `search_regulations` `async` and running the blocking Google call in a background thread (`asyncio.to_thread`) took five searches from ~6.7s to ~1.9s.
+- **Uncapped "thinking" is slow.** Gemini 2.5 Flash thinks before answering, with no limit by default; one web search turn varied from 10 seconds to 3 minutes. Capping the thinking budget made it consistently fast.
+- **Telling Gemini which sites to search isn't a guarantee.** It writes its own Google queries and often ignores `site:` hints. That's why "official vs other" is decided in _code_ from each page's domain, not left to the prompt.
+- **A failed search shouldn't sink the whole audit.** A tool that raises an error aborts the entire run. `search_regulations` retries quota errors and otherwise returns a "search unavailable" message so the report can still be written from what was found.
 
 ---
 
-## Part 5: Deploying to the Cloud (and everything that went wrong)
+## Part 5: Testing Locally
+
+Two ways to try the agent on your own machine before deploying:
+
+**1. The ADK web UI** — a chat window in your browser, plus an Events view showing every agent step, tool call and timing:
+
+```bash
+uv run adk web --port 8000 src
+```
+
+Then open http://127.0.0.1:8000 and pick `compliance_agent`. Start a **new session** after changing code, so old replies don't confuse the test.
+
+**2. The end-to-end script** — a repeatable three-message conversation (an audit, a "fix the gaps" follow-up, and a regulatory lookup follow-up), streamed the same way a web front end receives it:
+
+```bash
+uv run python scripts/test_local_pipeline.py
+```
+
+It prints which agent produced each step, so you can check the routing: the first message should go through the full pipeline and end with the sources table; the follow-ups should be answered directly by `compliance_assistant`.
+
+**Watch the search quota.** Each PDF search asks Vertex AI Search for a generated summary, and the default quota for those is **10 per minute per project** (`discoveryengine.googleapis.com/llm_requests`). One audit uses up to 4, so a few audits in quick succession can hit `429 Quota exceeded`. The agent retries briefly and carries on, but reports get thinner. To see or raise the limit: Google Cloud console → **IAM & Admin → Quotas**, filtered to "Discovery Engine API".
+
+---
+
+## Part 6: Deploying to the Cloud (and everything that went wrong)
 
 This part had the most learning value, because things broke in instructive ways. We're documenting the failures on purpose — future you (or a teammate) will hit the same walls otherwise.
 
@@ -312,9 +404,19 @@ gcloud logging read "resource.labels.reasoning_engine_id=<YOUR_ID>" \
 
 This pulls the actual stderr/stdout output from inside the failed deployment — the real Python tracebacks, not just a generic wrapper message. Whenever a cloud deployment fails with a vague error, checking the logs directly (rather than re-reading the vague error over and over) is almost always the fastest path to the real cause.
 
+### Bug #5 (avoided): the deploy can't "pickle" a network connection
+
+Deploying works by **pickling** `root_agent` — freezing the Python object into bytes, uploading them, and thawing them in the cloud. A live network connection (like the gRPC client inside our search provider) can't be frozen. Functions defined at the top level of a module are pickled as just a _reference_ ("re-import `search_regulations` from `compliance_agent.sub_agents.pdf_researcher`"), so the cloud side builds its own fresh connection. A function nested _inside_ another function would drag the live connection along and the deploy would fail.
+
+**Rule:** define every tool as a plain top-level function, never as a nested function. You can check before deploying:
+
+```bash
+uv run python -c "import cloudpickle; from compliance_agent.agent import root_agent; cloudpickle.dumps(root_agent); print('ok')"
+```
+
 ---
 
-## Part 6: Verifying It Actually Works, Remotely
+## Part 7: Verifying It Actually Works, Remotely
 
 ```python
 import vertexai
@@ -342,8 +444,9 @@ This confirms the deployed agent works completely independently of your own lapt
 
 ## What We Could Do Next (Ideas, Not Yet Built)
 
-- **A proper web front end**, so the VP sees a clean chat interface instead of raw Python event objects — planned to run on **Cloud Run**, a separate Google service for hosting web apps/APIs.
+- **A dedicated search index of regulator websites** (a Vertex AI Search "website" data store over OSFI, FCAC, OPC, FINTRAC, etc.). Every web result would be official by construction, with real page titles and direct links. Costs about $4 per 1,000 searches after a free trial; crawling and storage for basic website indexing are free.
+- **Lift the search-summary quota** — either request a higher `llm_requests` quota, or stop asking Vertex AI Search for summaries (use the plain 300-per-minute search quota and let the researcher summarize).
 - **Automated document ingestion** (a scheduled job that re-checks regulator websites for updates), instead of manually downloading PDFs.
-- **Document versioning**, so answers can say not just "per OSFI B-13" but "per the version effective January 2024," in case guidelines get updated later.
-- **Tighter IAM scoping** — right now we granted `discoveryengine.viewer` at the whole-project level; a more advanced setup could scope it down to just the one specific Search app.
-- **Automated tests**, so future code changes can be checked automatically rather than manually re-running scripts each time.
+- **Document versioning**, so answers can say not just "per OSFI B-13" but "per the version effective January 2024."
+- **Tighter IAM scoping** — we granted `discoveryengine.viewer` at the whole-project level; a more advanced setup could scope it down to just the one Search app.
+- **Automated tests** that check report structure and routing on every change, instead of running `scripts/test_local_pipeline.py` by hand.
