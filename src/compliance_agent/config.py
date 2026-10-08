@@ -27,7 +27,8 @@ class AgentConfig:
         agent_location: Vertex AI Agent Engine location (e.g. "us-central1").
         search_engine_id: The Vertex AI Search app's engine ID.
         model_name: Gemini model identifier used for reasoning.
-        environment: "local" or "remote" — lets code branch behavior if ever needed.
+        reasoning_engine_resource_name: The deployed Agent Engine's resource
+            name, or "" before the first deploy. Only scripts/ use it.
     """
 
     project_id: str
@@ -35,7 +36,7 @@ class AgentConfig:
     agent_location: str
     search_engine_id: str
     model_name: str
-    environment: str
+    reasoning_engine_resource_name: str
 
 
 def load_config() -> AgentConfig:
@@ -63,5 +64,5 @@ def load_config() -> AgentConfig:
         agent_location=os.environ["AGENT_LOCATION"],
         search_engine_id=os.environ["SEARCH_ENGINE_ID"],
         model_name=os.environ.get("MODEL_NAME", "gemini-2.5-flash"),
-        environment=os.environ.get("ENVIRONMENT", "local"),
+        reasoning_engine_resource_name=os.environ.get("REASONING_ENGINE_RESOURCE_NAME", ""),
     )
