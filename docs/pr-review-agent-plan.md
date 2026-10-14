@@ -2,6 +2,12 @@
 
 Status: draft for discussion. Nothing here is built yet.
 
+This is a **separate project** with its own repo, deploy and release
+cadence. It builds on what we learned in `banking-reg-self-audit`, but
+doesn't share code with it at runtime. §4 lists what carries over and how.
+This doc lives here only until the new repo exists; then it moves there as
+the starting design doc.
+
 ## 1. Goal
 
 Run the compliance self-audit on code changes as well as feature
@@ -16,7 +22,7 @@ our engineering standards, and responds inside the PR:
 - a `Compliance pre-audit` check run on the head commit
 - one BigQuery row per finding, which is the audit trail and the input for a later Jira backfill
 
-The review is advisory, like the existing agent. In v1 the check run never
+The review is advisory, like the self-audit chat agent. In v1 the check run never
 blocks a merge (see §9).
 
 Out of scope for v1: Jira, auto-fix commits, chat follow-ups in the PR, and
@@ -72,34 +78,44 @@ Differences from the sketch we started with:
   Secret Manager.
 
 Why not run ADK inside the worker and skip Agent Engine? That would also
-work and is simpler. We keep Agent Engine because the deploy path, IAM setup
-and console tracing already exist for the current agent (README Part 6).
+work and is simpler. We keep Agent Engine because we already know its deploy path, IAM setup
+and console tracing from the self-audit project (its README Part 6).
 Revisit this if latency or cost becomes a problem.
 
-## 4. Repo layout
+## 4. New repo, and what carries over
 
-The search code is currently private to `compliance_agent`
-(`_contracts/search.py`, `_providers/vertex_search.py`, `_sources.py`, and
-`search_regulations` in `sub_agents/pdf_researcher.py`). Both agents need
-it, so step 0 is to extract it rather than import underscored modules across
-packages:
+### What it shares with `banking-reg-self-audit`
+
+The two projects share **infrastructure and data**, not code:
+
+| Shared | How |
+|---|---|
+| GCP project, Vertex AI Search app, regulatory PDFs | The PR agent queries the same search app by `SEARCH_ENGINE_ID`. The PDFs stay managed in one place. |
+| Engineering standards (§6.4) | A new data store attached to the same search app, so the chat agent can cite standards too. |
+| Patterns | Copied in, not imported: Protocol + Provider contracts, `config.py` as the only env reader, module-level pickle-safe tools, structured output rendered by code, citation validation, and the deploy script with pinned packages. |
+
+The reused code is roughly 150 lines: the search contract, the Vertex
+provider, source tracking and the quota-retry wrapper. Copying it is cheaper
+than publishing and versioning a shared package for two consumers. If a
+third consumer appears, extract `regsearch` into its own package then.
+
+Nothing in `banking-reg-self-audit` has to change for this project to start.
+
+### Layout of the new repo (`ios-compliance-pr-review`, name TBD)
 
 ```
 src/
-  regsearch/                    # NEW shared package, moved out of compliance_agent
-    contracts.py                # RegulationSearchProvider, SearchResult (+ Passage, §6.2)
-    vertex_search.py            # VertexSearchProvider
-    sources.py                  # Source tracking (from _sources.py)
-    tools.py                    # search_regulations (module-level, pickle-safe)
-  compliance_agent/             # unchanged behaviour, now imports regsearch
-  pr_review_agent/              # NEW ADK app; root_agent deployed as a 2nd Agent Engine
+  pr_review_agent/              # ADK app; root_agent deployed to its own Agent Engine
     agent.py
     config.py                   # the only os.environ reader for this package
     _prompts.py
-    _review.py                  # PrReviewReport schema + validation (like _report.py)
+    _review.py                  # PrReviewReport schema + validation
     _triage.py                  # deterministic file → topic mapping
-    tools.py                    # get_file_content (read-only)
-  pr_review_worker/             # NEW Cloud Run service (receiver + worker routes)
+    _contracts/search.py        # copied, plus retrieve() / Passage (§6.2)
+    _providers/vertex_search.py # copied, plus retrieve()
+    _sources.py                 # copied
+    tools.py                    # retrieve_standards, search_regulations, get_file_content
+  pr_review_worker/             # Cloud Run service (receiver + worker routes)
     main.py                     # FastAPI: POST /webhook, POST /pubsub
     contracts.py                # PullRequestSource, PullRequestPublisher, FollowupSink
     github_source.py            # GitHub App: read
@@ -109,15 +125,19 @@ src/
       github_issue_sink.py      # later
       jira_sink.py              # later
     publish.py                  # PrReviewReport → publisher + sinks, dry-run aware
-data/standards/                 # NEW engineering standards docs (§6.4)
+standards/                      # engineering standards source docs (§6.4), uploaded to GCS
+infra/                          # Terraform or gcloud scripts: Pub/Sub, Cloud Run, BigQuery, IAM, secrets
 scripts/
-  deploy_pr_agent.py            # copy of deploy_agent.py for the 2nd engine
+  deploy_agent.py               # adapted from the self-audit repo
   test_pr_review.py             # run against a fixture or a live PR, dry-run publish
-tests/fixtures/prs/*.json       # recorded PR payloads + expected findings
+tests/
+  fixtures/prs/*.json           # recorded PR payloads + expected findings
+  unit/                         # triage, validation, publisher (no network)
 ```
 
-Running two Agent Engines (the chat assistant and the PR reviewer) keeps
-their prompts, quotas and release cadence independent.
+Unlike the self-audit repo, this one needs unit tests and CI from day one.
+Most of its logic (triage, validation, idempotency, publishing) is
+deterministic code that can be tested without calling a model.
 
 ## 5. Contracts
 
@@ -195,7 +215,7 @@ PRs are reviewed on the highest-signal files only, and the summary says so.
 ### 6.2 Agent shape
 
 The PR reviewer has no chat and no router, so it doesn't hit the constraint
-that keeps `compliance_agent` on `SequentialAgent` (see the `agent.py`
+that keeps the self-audit agent on `SequentialAgent` (see its `agent.py`
 docstring). It can use ADK's `Workflow` directly if the API fits when we
 build it. Otherwise it uses the same `SequentialAgent` pattern.
 
@@ -212,8 +232,9 @@ citations to every PR. The chat agent still covers "is there newer
 guidance?"
 
 **Search quota.** Each `search_regulations` call uses one Vertex AI Search
-*summary* request, and the quota is 10 per minute per project (README Part
-5). That is fine for chat but will throttle a busy PR stream. Add a
+*summary* request, and the quota is 10 per minute per project (self-audit
+README Part 5). That is fine for chat, but a busy PR stream would throttle
+itself, and the self-audit agent too if both run in the same project. Add a
 `retrieve(query) -> list[Passage]` method to the search contract that
 returns extractive segments with no summary, so it doesn't count against
 `llm_requests`. The PR agent mainly uses `retrieve_standards`, and the
@@ -257,7 +278,7 @@ The current corpus (OSFI B-13 and E-23, the FCAC framework, PIPEDA) is
 written as principles. Nothing in it says "don't store tokens in
 `UserDefaults`". If code is checked against principles alone, findings will
 be vague and citations weak. v1 needs a small internal standards document set
-in `data/standards/`, indexed into the same Vertex AI Search app or a second
+in `standards/`, indexed into the same Vertex AI Search app or a second
 data store. Each control has:
 
 - a stable id (`STD-IOS-KEYCHAIN-01`), which becomes `rule_ref`
@@ -289,7 +310,7 @@ approve them. **This is the critical-path dependency for v1.**
   gets its own service account with least privilege: the receiver can
   publish to Pub/Sub; the worker can read the App key, invoke Agent Engine
   and write to BigQuery; the Reasoning Engine Service Agent gets
-  `discoveryengine.viewer` (README Part 6, Bug #4) plus read access to the
+  `discoveryengine.viewer` (self-audit README Part 6, Bug #4) plus read access to the
   App key.
 - The diff is untrusted input. The prompt states that PR content is data,
   not instructions. Because the model has no write tools (§3), the worst an
@@ -304,7 +325,7 @@ approve them. **This is the critical-path dependency for v1.**
 
 | Phase | Scope | Exit criteria |
 |---|---|---|
-| **0. Refactor** | Extract `regsearch`. The chat agent behaves the same (`scripts/test_local_pipeline.py`). | Same output on the 3-turn script |
+| **0. Bootstrap** | Create the repo, copy the search code, add CI with lint, type-check and unit tests, and stand up the standards data store. | `test_pr_review.py` can query the shared search app |
 | **1. Offline agent** | `pr_review_agent`, triage, schema, `retrieve`, standards v0. `scripts/test_pr_review.py` runs on fixture PRs with dry-run publish to stdout. | On about 10 labelled fixture PRs (seeded violations plus clean PRs): ≥80% of seeded High issues found, ≤1 false positive per clean PR |
 | **2. Shadow** | Receiver, worker and Agent Engine deployed. `PUBLISH_MODE=shadow` writes to BigQuery and logs only, on 1 to 2 iOS repos. | Two weeks of data reviewed with compliance; precision acceptable to them |
 | **3. Comment** | `PUBLISH_MODE=comment` turns on the summary, inline comments, labels, reviewers and the neutral check. | Team feedback; no complaints about duplicate or noisy comments |
@@ -316,8 +337,9 @@ so moving between phases doesn't require a redeploy of the agent.
 ## 10. Open questions
 
 1. GitHub or Bitbucket for the iOS repos, and github.com or GHES? (§2)
-2. Who owns and signs off `data/standards/`, and how is it versioned?
+2. Who owns and signs off `standards/`, and how is it versioned?
 3. Is source-to-Gemini approved, and in which region?
 4. Advisory only, or should High findings eventually block merges?
 5. Which teams map to which topics for reviewer requests?
 6. Raise the Vertex AI Search `llm_requests` quota, or rely on `retrieve` only?
+7. Same GCP project as the self-audit agent, or a separate one with cross-project search access?
